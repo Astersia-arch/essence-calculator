@@ -18,7 +18,7 @@
 
 ```
 项目目录/
-├── matrix_planner.py    # 主程序文件
+├── main.py    # 主程序文件
 ├── test.txt            # 需要刷取基质的武器列表
 ├── wqsx.txt           # 武器属性数据库
 └── jz.txt            # 区域属性数据
@@ -89,7 +89,7 @@ pip install pandas
 2. 打开命令行终端
 3. 运行以下命令：
 ```bash
-python matrix_planner.py
+python main.py
 ```
 
 ## 使用步骤
@@ -101,7 +101,7 @@ python matrix_planner.py
 
 ### 步骤2：运行程序
 ```bash
-python matrix_planner.py
+python main.py
 ```
 
 ### 步骤3：查看输出
