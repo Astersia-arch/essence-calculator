@@ -22,9 +22,10 @@ GitHub地址：https://github.com/Astersia-arch/essence-calculator
 essence-calculator/
 ├── main.py              # 主程序文件
 ├── weapons.csv          # 武器数据库
-├── area.csv            # 区域信息数据库
-├── res.csv             # 程序生成的刷取策略（自动生成）
-└── README.md           # 说明文档
+├── area.csv             # 区域信息数据库
+├── res.csv              # 程序生成的刷取策略（自动生成）
+├── LICENSE              # 许可说明
+└── README.md            # 说明文档
 ```
 
 ## 🚀 快速开始
