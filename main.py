@@ -1,459 +1,518 @@
+#!/usr/bin/env python3
+"""
+终末地武器基质刷取规划器 - GUI版本
+"""
+
 import pandas as pd
-from collections import defaultdict, Counter
+from typing import Set, Dict, List, Tuple, Optional
+from dataclasses import dataclass
+from collections import Counter
+import logging
+from pathlib import Path
+from enum import Enum
+import tkinter as tk
+from tkinter import ttk, messagebox
 import math
 
-class MatrixPlannerOptimized:
-    def __init__(self):
-        # 主属性集合
-        self.main_attrs = ['力量', '敏捷', '智识', '意志', '主能力']
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
+
+
+class AttributeType(Enum):
+    SUB = "sub"
+    SKILL = "skill"
+
+
+@dataclass(frozen=True)
+class Weapon:
+    name: str
+    weapon_type: str
+    rarity: int
+    main_attrs: Tuple[str, ...]
+    sub_attr: str
+    skill: str
+    raw_data: Tuple  # 原始行数据，用于动态显示
+    
+    def __hash__(self):
+        return hash((self.name, self.weapon_type, self.rarity))
+
+
+@dataclass
+class Zone:
+    name: str
+    sub_attrs: Set[str]
+    skills: Set[str]
+    cost_multiplier: float = 1.0
+
+
+@dataclass
+class Strategy:
+    zone: str
+    main_attrs: Tuple[str, ...]
+    sub_attr: Optional[str]
+    skill: Optional[str]
+    weapons: List[Weapon]
+    target_count: int
+    
+    def __post_init__(self):
+        if self.sub_attr is not None and self.skill is not None:
+            raise ValueError("只能固定一种属性")
+    
+    @property
+    def fixed_type(self) -> AttributeType:
+        return AttributeType.SUB if self.sub_attr else AttributeType.SKILL
+
+
+class EssenceCalculator:
+    def __init__(self, data_dir: str = "."):
+        self.data_dir = Path(data_dir)
+        self.weapons: Dict[str, Weapon] = {}
+        self.zones: Dict[str, Zone] = {}
+        self.columns: List[str] = []  # 动态表头
         
-        # 区域成本权重
-        self.region_cost = {
-            '枢纽区': 1,
-            '源石研究园': 1,
-            '矿脉源区': 1,
-            '供能高地': 1,
-            '武陵城': 7
+    def load_data(self) -> None:
+        try:
+            df_weapons = pd.read_csv(self.data_dir / "weapons.csv", encoding='utf-8')
+            self.columns = df_weapons.columns.tolist()  # 保存表头
+            
+            df_weapons = df_weapons.dropna(subset=['名称', '主属性', '附加属性', '技能'])
+            
+            for _, row in df_weapons.iterrows():
+                weapon = Weapon(
+                    name=str(row['名称']),
+                    weapon_type=str(row.get('类别', '未知')),
+                    rarity=int(row.get('稀有度', 5)),
+                    main_attrs=tuple(str(row['主属性']).split('/')),
+                    sub_attr=str(row['附加属性']),
+                    skill=str(row['技能']),
+                    raw_data=tuple(row[col] for col in self.columns)  # 保存原始行
+                )
+                self.weapons[weapon.name] = weapon
+                
+            logger.info(f"已加载 {len(self.weapons)} 个武器，列: {self.columns}")
+            
+            df_zones = pd.read_csv(self.data_dir / "area.csv", encoding='utf-8')
+            
+            for _, row in df_zones.iterrows():
+                zone_name = str(row['区域'])
+                sub_attrs = {str(row[f'附加属性{i}']) for i in range(1, 9) 
+                           if f'附加属性{i}' in row and pd.notna(row[f'附加属性{i}'])}
+                skills = {str(row[f'技能{i}']) for i in range(1, 9) 
+                         if f'技能{i}' in row and pd.notna(row[f'技能{i}'])}
+                
+                cost = float(row.get('成本', 1.0)) if '成本' in row else 1.0
+                
+                self.zones[zone_name] = Zone(
+                    name=zone_name,
+                    sub_attrs=sub_attrs,
+                    skills=skills,
+                    cost_multiplier=cost
+                )
+                
+            logger.info(f"已加载 {len(self.zones)} 个区域")
+            
+        except FileNotFoundError as e:
+            logger.error(f"文件未找到: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"数据加载失败: {e}")
+            raise
+
+    def analyze_optimal_strategy(self, weapons: List[Weapon]) -> List[Strategy]:
+        remaining = set(weapons)
+        strategies = []
+        
+        while remaining:
+            best = self._find_best_strategy(remaining)
+            if not best:
+                break
+            
+            strategies.append(best)
+            remaining -= set(best.weapons)
+            logger.info(f"分组: {best.zone} | {len(best.weapons)}个武器 | 剩余{len(remaining)}个")
+        
+        return strategies
+
+    def _find_best_strategy(self, weapons_set: Set[Weapon]) -> Optional[Strategy]:
+        if not weapons_set:
+            return None
+
+        weapons_list = list(weapons_set)
+        
+        sub_freq = Counter()
+        skill_freq = Counter()
+        
+        for w in weapons_list:
+            weight = w.rarity / 5.0
+            sub_freq[w.sub_attr] += weight
+            skill_freq[w.skill] += weight
+        
+        best_score = float('-inf')
+        best_strategy = None
+        
+        for fixed_type, freq_dict in [(AttributeType.SUB, sub_freq), 
+                                      (AttributeType.SKILL, skill_freq)]:
+            
+            for attr_name, freq in freq_dict.most_common():
+                if fixed_type == AttributeType.SUB:
+                    matched = [w for w in weapons_list if w.sub_attr == attr_name]
+                else:
+                    matched = [w for w in weapons_list if w.skill == attr_name]
+                
+                if not matched:
+                    continue
+                
+                zone_name, zone = self._find_best_zone(matched, fixed_type, attr_name)
+                if not zone:
+                    continue
+                
+                main_attrs = self._select_optimal_main_attrs(matched)
+                
+                coverage = len(matched)
+                cost_factor = 1 / zone.cost_multiplier
+                variety = len(set(w.name for w in matched)) / coverage
+                score = coverage * cost_factor * variety * (1 + freq * 0.1)
+                
+                if score > best_score:
+                    best_score = score
+                    runs = self._calculate_runs(len(matched), len(main_attrs))
+                    
+                    best_strategy = Strategy(
+                        zone=zone_name,
+                        main_attrs=main_attrs,
+                        sub_attr=attr_name if fixed_type == AttributeType.SUB else None,
+                        skill=attr_name if fixed_type == AttributeType.SKILL else None,
+                        weapons=matched,
+                        target_count=int(runs)
+                    )
+        
+        return best_strategy
+
+    def _find_best_zone(self, weapons: List[Weapon], 
+                       fixed_type: AttributeType, 
+                       fixed_attr: str) -> Tuple[str, Optional[Zone]]:
+        candidates = []
+        
+        for zone_name, zone in self.zones.items():
+            if fixed_type == AttributeType.SUB:
+                if fixed_attr not in zone.sub_attrs:
+                    continue
+            else:
+                if fixed_attr not in zone.skills:
+                    continue
+            
+            compatible = 0
+            for w in weapons:
+                if fixed_type == AttributeType.SUB:
+                    if w.skill in zone.skills:
+                        compatible += 1
+                else:
+                    if w.sub_attr in zone.sub_attrs:
+                        compatible += 1
+            
+            score = compatible / zone.cost_multiplier
+            candidates.append((zone_name, zone, score))
+        
+        if not candidates:
+            return "未知区域", None
+            
+        candidates.sort(key=lambda x: x[2], reverse=True)
+        return candidates[0][0], candidates[0][1]
+
+    def _select_optimal_main_attrs(self, weapons: List[Weapon]) -> Tuple[str, ...]:
+        all_attrs = []
+        for w in weapons:
+            all_attrs.extend(w.main_attrs)
+        
+        top3 = [attr for attr, _ in Counter(all_attrs).most_common(3)]
+        return tuple(top3)
+
+    def _calculate_runs(self, weapon_count: int, main_attr_count: int) -> int:
+        drops_per_run = 2
+        
+        if main_attr_count <= 3:
+            combos = 1
+        else:
+            combos = math.comb(main_attr_count, 3)
+        
+        runs = (weapon_count / drops_per_run) * 1.5 * combos
+        return max(1, int(runs))
+
+
+class EssenceCalculatorGUI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("终末地武器基质刷取规划器")
+        self.root.geometry("950x800")
+        
+        self.calculator = EssenceCalculator()
+        try:
+            self.calculator.load_data()
+        except Exception as e:
+            messagebox.showerror("错误", f"加载数据失败: {e}")
+            raise
+        
+        self.selected_weapons: Dict[str, Weapon] = {}  # 改用dict便于删除
+        
+        self._build_ui()
+        self._load_weapons_to_source()
+        
+    def _calc_width(self, text: str, font_size: int = 10) -> int:
+        return len(str(text)) * 2 * font_size + 16
+    
+    def _create_frame(self, parent, title: str, row: int, col: int, 
+                     rowspan: int = 1, colspan: int = 1) -> ttk.LabelFrame:
+        frame = ttk.LabelFrame(parent, text=title, padding="5")
+        frame.grid(row=row, column=col, rowspan=rowspan, columnspan=colspan,
+                  sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        return frame
+    
+    def _create_tree(self, parent, columns: List[str], widths: Dict[str, int], 
+                    row: int, height: int = 15) -> ttk.Treeview:
+        tree = ttk.Treeview(parent, columns=columns, show="headings", 
+                           selectmode="extended", height=height)
+        tree.grid(row=row, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        for col in columns:
+            tree.heading(col, text=col)
+            w = widths.get(col, 100)
+            tree.column(col, width=w, anchor='center', minwidth=50)
+        
+        vsb = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=tree.yview)
+        vsb.grid(row=row, column=1, sticky=(tk.N, tk.S))
+        tree.configure(yscrollcommand=vsb.set)
+        
+        return tree
+    
+    def _create_button_group(self, parent, commands: List[Tuple[str, callable]], row: int):
+        frame = ttk.Frame(parent)
+        frame.grid(row=row, column=0, pady=5)
+        for text, cmd in commands:
+            ttk.Button(frame, text=text, command=cmd).pack(side=tk.LEFT, padx=2)
+    
+    def _build_ui(self):
+        main = ttk.Frame(self.root, padding="10")
+        main.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main.columnconfigure(0, weight=1)
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(0, weight=3)
+        main.rowconfigure(1, weight=2)
+        
+        # 获取所有列名
+        all_cols = self.calculator.columns
+        
+        # 左侧显示所有列
+        left = self._create_frame(main, "武器库", 0, 0)
+        
+        # 筛选栏
+        filter_bar = ttk.Frame(left)
+        filter_bar.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+        
+        # 动态创建筛选（使用前3列作为筛选选项）
+        self.filter_vars = []
+        for i, col_name in enumerate(all_cols[:3]):  # 前3列通常是类别、稀有度、名称
+            ttk.Label(filter_bar, text=f"{col_name}:").pack(side=tk.LEFT, padx=2)
+            var = tk.StringVar(value="全部")
+            self.filter_vars.append((col_name, var))
+            values = ["全部"] + sorted(list(set(str(w.raw_data[i]) for w in self.calculator.weapons.values())))
+            cb = ttk.Combobox(filter_bar, textvariable=var, values=values, state="readonly", width=10)
+            cb.pack(side=tk.LEFT, padx=2)
+            var.trace('w', lambda *args: self._apply_filter())
+        
+        ttk.Label(filter_bar, text="搜索:").pack(side=tk.LEFT, padx=2)
+        self.search_var = tk.StringVar()
+        ttk.Entry(filter_bar, textvariable=self.search_var, width=15).pack(side=tk.LEFT, padx=2)
+        self.search_var.trace('w', lambda *args: self._apply_filter())
+        
+        # 左侧表格 - 显示所有列
+        widths = {}
+        for i, col in enumerate(all_cols):
+            max_len = max(len(col), max(len(str(w.raw_data[i])) for w in self.calculator.weapons.values()))
+            widths[col] = self._calc_width(max_len)
+        
+        self.source_tree = self._create_tree(left, all_cols, widths, 1)
+        
+        # 绑定双击添加事件
+        self.source_tree.bind('<Double-1>', lambda e: self._add_selected())
+        
+        self._create_button_group(left, [("➡ 添加选中", self._add_selected)], 2)
+        
+        # 右侧 - 只显示前3列（通常是类别、稀有度、名称）
+        right = self._create_frame(main, "已选武器", 0, 1)
+        right_cols = all_cols[:3]  # 取前3列
+        right_widths = {col: widths[col] for col in right_cols}
+        
+        self.target_tree = self._create_tree(right, right_cols, right_widths, 0)
+        self.target_tree.bind('<Delete>', lambda e: self._remove_selected())  # 支持Delete键删除
+        
+        self._create_button_group(right, [
+            ("⬅ 删除选中", self._remove_selected),
+            ("⚠ 清空全部", self._clear_all)
+        ], 1)
+        
+        # 底部 - 策略结果
+        bottom = self._create_frame(main, "刷取策略", 1, 0, colspan=2)
+        
+        res_cols = ['区域', '主属性1', '主属性2', '主属性3', '附加属性', '技能', '次数', '武器列表']
+        res_widths = {
+            '区域': 80, '主属性1': 60, '主属性2': 60, '主属性3': 60,
+            '附加属性': 70, '技能': 70, '次数': 50, '武器列表': 600
         }
         
-        # 加载数据
-        self.load_data()
+        self.result_tree = self._create_tree(bottom, res_cols, res_widths, 0)
         
-    def load_data(self):
-        """加载武器属性数据"""
-        # 读取test.txt中的武器名称
-        try:
-            with open('test.txt', 'r', encoding='utf-8') as f:
-                test_weapon_names = [line.strip() for line in f if line.strip()]
-            print(f"从test.txt中读取了 {len(test_weapon_names)} 个武器名称")
-        except Exception as e:
-            print(f"读取test.txt失败: {e}")
-            test_weapon_names = []
+        # 水平滚动条给武器列表
+        hsb = ttk.Scrollbar(bottom, orient=tk.HORIZONTAL, command=self.result_tree.xview)
+        hsb.grid(row=1, column=0, sticky=(tk.W, tk.E))
+        self.result_tree.configure(xscrollcommand=hsb.set)
         
-        # 加载武器属性
-        self.weapons = []
-        if test_weapon_names:
-            try:
-                # 读取wqsx.txt，查找对应武器的属性
-                df_weapons = pd.read_csv('wqsx.txt', sep='\t', encoding='utf-8')
-                print(f"从wqsx.txt中找到了 {len(df_weapons)} 行武器数据")
-                
-                # 创建一个武器名称到属性的映射
-                weapon_name_map = {}
-                for _, row in df_weapons.iterrows():
-                    weapon_name = row['名称']
-                    weapon_name_map[weapon_name] = {
-                        'name': weapon_name,
-                        'main_attr': row['主属性'],
-                        'add_attr': row['附加属性'],
-                        'skill': row['技能'],
-                        'category': row['类别'],
-                        'rarity': row['稀有度']
-                    }
-                
-                # 根据test.txt中的武器名称获取属性
-                found_count = 0
-                not_found_weapons = []
-                
-                for weapon_name in test_weapon_names:
-                    if weapon_name in weapon_name_map:
-                        self.weapons.append(weapon_name_map[weapon_name])
-                        found_count += 1
-                    else:
-                        not_found_weapons.append(weapon_name)
-                
-                print(f"成功匹配了 {found_count} 个武器的属性")
-                if not_found_weapons:
-                    print(f"以下武器在wqsx.txt中未找到: {', '.join(not_found_weapons)}")
-                    
-            except Exception as e:
-                print(f"加载武器数据失败: {e}")
-                print("请确保wqsx.txt文件格式正确，包含以下列：类别、稀有度、名称、主属性、附加属性、技能")
-        
-        # 如果没有从文件中读取到数据，使用示例数据
-        if not self.weapons:
-            print("使用示例数据")
-            self.weapons = [
-                {'name': '钢铁余音', 'main_attr': '敏捷', 'add_attr': '物理', 'skill': '巧技'},
-                {'name': '坚城铸造者', 'main_attr': '智识', 'add_attr': '终结技', 'skill': '昂扬'}
-            ]
-        
-        # 加载区域属性
-        self.regions = {}
-        try:
-            df_regions = pd.read_csv('jz.txt', sep='\t', encoding='utf-8')
-            for _, row in df_regions.iterrows():
-                region_name = row['区域']
-                add_attrs = [row[f'附加属性{i}'] for i in range(1, 9)]
-                skills = [row[f'技能{i}'] for i in range(1, 9)]
-                self.regions[region_name] = {
-                    'add_attrs': add_attrs,
-                    'skills': skills
-                }
-            print(f"加载了 {len(self.regions)} 个区域的数据")
-        except Exception as e:
-            print(f"加载区域数据失败: {e}")
-            print("使用示例区域数据")
-            # 使用示例数据
-            self.regions = {
-                '枢纽区': {
-                    'add_attrs': ['攻击', '灼热', '电磁', '寒冷', '自然', '源石', '终结技', '法术'],
-                    'skills': ['强攻', '压制', '追袭', '粉碎', '巧技', '迸发', '流转', '效益']
-                },
-                '源石研究园': {
-                    'add_attrs': ['攻击', '物理', '电磁', '寒冷', '自然', '暴击率', '终结技', '法术'],
-                    'skills': ['压制', '追袭', '昂扬', '巧技', '附术', '医疗', '切骨', '效益']
-                },
-                '矿脉源区': {
-                    'add_attrs': ['生命', '物理', '灼热', '寒冷', '自然', '暴击率', '源石', '治疗'],
-                    'skills': ['强攻', '压制', '巧技', '残暴', '附术', '迸发', '夜幂', '效益']
-                },
-                '供能高地': {
-                    'add_attrs': ['攻击', '生命', '物理', '灼热', '自然', '暴击率', '源石', '治疗'],
-                    'skills': ['追袭', '粉碎', '昂扬', '残暴', '附术', '医疗', '切骨', '流转']
-                },
-                '武陵城': {
-                    'add_attrs': ['攻击', '生命', '电磁', '寒冷', '暴击率', '终结技', '法术', '治疗'],
-                    'skills': ['强攻', '粉碎', '残暴', '医疗', '切骨', '迸发', '夜幂', '流转']
-                }
-            }
+        self._create_button_group(bottom, [("🚀 开始计算策略", self._calculate)], 2)
     
-    def find_region_for_group(self, weapons_group):
-        """
-        为武器组找到合适的区域
-        返回 (区域, 需要固定的属性类型, 需要固定的属性值)
-        """
-        best_region = None
-        best_fixed_type = None
-        best_fixed_value = None
-        best_score = float('inf')
+    def _load_weapons_to_source(self):
+        """加载武器到左侧表格"""
+        all_cols = self.calculator.columns
+        for weapon in self.calculator.weapons.values():
+            self.source_tree.insert('', tk.END, values=weapon.raw_data, iid=weapon.name)
+    
+    def _apply_filter(self):
+        """应用筛选"""
+        all_cols = self.calculator.columns
         
-        # 统计武器组的属性
-        main_attrs_set = set(w['main_attr'] for w in weapons_group)
-        add_attrs_set = set(w['add_attr'] for w in weapons_group)
-        skills_set = set(w['skill'] for w in weapons_group)
+        # 获取筛选条件（列名->值）
+        filters = {}
+        for col_name, var in self.filter_vars:
+            val = var.get()
+            if val != "全部":
+                filters[col_name] = val
         
-        # 尝试每个区域
-        for region_name, region_data in self.regions.items():
-            region_add_attrs = set(region_data['add_attrs'])
-            region_skills = set(region_data['skills'])
+        search = self.search_var.get().lower()
+        
+        self.source_tree.delete(*self.source_tree.get_children())
+        
+        for weapon in self.calculator.weapons.values():
+            # 检查固定筛选项
+            match = True
+            for col_name, filter_val in filters.items():
+                col_idx = all_cols.index(col_name)
+                if str(weapon.raw_data[col_idx]) != filter_val:
+                    match = False
+                    break
             
-            # 检查所有武器是否都在该区域可用
-            if not add_attrs_set.issubset(region_add_attrs):
-                continue
-            if not skills_set.issubset(region_skills):
+            if not match:
                 continue
             
-            # 尝试固定附加属性
-            for add_attr in add_attrs_set:
-                # 计算主属性组合
-                main_attrs_list = list(main_attrs_set)
-                if len(main_attrs_list) <= 3:
-                    # 可以直接使用所有主属性
-                    score = self.calculate_group_cost(weapons_group, region_name, 'add_attr', add_attr)
-                    if score < best_score:
-                        best_score = score
-                        best_region = region_name
-                        best_fixed_type = 'add_attr'
-                        best_fixed_value = add_attr
-                else:
-                    # 需要选择3个主属性，尝试所有组合
-                    for main_combo in self.get_main_attr_combinations(main_attrs_list):
-                        # 只考虑包含这些主属性的武器
-                        valid_weapons = [w for w in weapons_group if w['main_attr'] in main_combo]
-                        if valid_weapons:
-                            score = self.calculate_group_cost(valid_weapons, region_name, 'add_attr', add_attr)
-                            if score < best_score:
-                                best_score = score
-                                best_region = region_name
-                                best_fixed_type = 'add_attr'
-                                best_fixed_value = add_attr
+            # 检查搜索（在所有字段中搜索）
+            if search and search not in ' '.join(str(x) for x in weapon.raw_data).lower():
+                continue
             
-            # 尝试固定技能
-            for skill in skills_set:
-                # 计算主属性组合
-                main_attrs_list = list(main_attrs_set)
-                if len(main_attrs_list) <= 3:
-                    # 可以直接使用所有主属性
-                    score = self.calculate_group_cost(weapons_group, region_name, 'skill', skill)
-                    if score < best_score:
-                        best_score = score
-                        best_region = region_name
-                        best_fixed_type = 'skill'
-                        best_fixed_value = skill
-                else:
-                    # 需要选择3个主属性，尝试所有组合
-                    for main_combo in self.get_main_attr_combinations(main_attrs_list):
-                        # 只考虑包含这些主属性的武器
-                        valid_weapons = [w for w in weapons_group if w['main_attr'] in main_combo]
-                        if valid_weapons:
-                            score = self.calculate_group_cost(valid_weapons, region_name, 'skill', skill)
-                            if score < best_score:
-                                best_score = score
-                                best_region = region_name
-                                best_fixed_type = 'skill'
-                                best_fixed_value = skill
-        
-        return best_region, best_fixed_type, best_fixed_value, best_score
+            self.source_tree.insert('', tk.END, values=weapon.raw_data, iid=weapon.name)
     
-    def get_main_attr_combinations(self, main_attrs_list):
-        """获取所有3主属性组合"""
-        if len(main_attrs_list) <= 3:
-            return [main_attrs_list]
+    def _add_selected(self):
+        """添加选中到右侧"""
+        selection = self.source_tree.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先在左侧选择武器")
+            return
         
-        from itertools import combinations
-        return list(combinations(main_attrs_list, 3))
+        added = 0
+        for item in selection:
+            if item not in self.selected_weapons:
+                weapon = self.calculator.weapons[item]
+                self.selected_weapons[item] = weapon
+                # 右侧只显示前3列
+                self.target_tree.insert('', tk.END, values=weapon.raw_data[:3], iid=item)
+                added += 1
+        
+        if added == 0:
+            messagebox.showinfo("提示", "选中的武器已在列表中")
     
-    def calculate_group_cost(self, weapons_group, region_name, fixed_type, fixed_value):
-        """计算武器组的刷取成本"""
-        # 统计主属性分布
-        main_attr_counter = Counter(w['main_attr'] for w in weapons_group)
+    def _remove_selected(self):
+        """从右侧删除选中"""
+        selection = self.target_tree.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先在右侧选择要删除的武器")
+            return
         
-        # 计算需要的主属性组合数
-        if len(main_attr_counter) <= 3:
-            # 一组配置即可
-            # 计算最耗时的主属性组合
-            max_count = max(main_attr_counter.values())
-            runs_needed = math.ceil(max_count / 2)  # 每次刷取给2个基质
-            
-            # 每个主属性组合需要12次刷取（为了高概率获得）
-            times_needed = runs_needed * 12
-            
-            # 应用区域权重
-            cost = times_needed * self.region_cost[region_name]
-            return cost
-        else:
-            # 需要多组配置，这里简化处理
-            total_times = 0
-            main_attrs_list = list(main_attr_counter.keys())
-            
-            # 将主属性分组，每组最多3个
-            for i in range(0, len(main_attrs_list), 3):
-                group_attrs = main_attrs_list[i:i+3]
-                # 计算这组主属性的武器数量
-                group_count = sum(main_attr_counter[attr] for attr in group_attrs)
-                runs_needed = math.ceil(group_count / 2)
-                total_times += runs_needed * 12
-            
-            # 应用区域权重
-            cost = total_times * self.region_cost[region_name]
-            return cost
+        count = len(selection)
+        if count > 1:
+            if not messagebox.askyesno("确认", f"确定删除选中的 {count} 个武器吗？"):
+                return
+        
+        for item in selection:
+            self.target_tree.delete(item)
+            del self.selected_weapons[item]
     
-    def build_attribute_tree(self, weapons):
-        """构建属性树并寻找最优分组"""
-        # 初始状态：所有武器未分配
-        unassigned = weapons.copy()
-        assignments = []
-        total_cost = 0
+    def _clear_all(self):
+        """清空全部"""
+        if not self.selected_weapons:
+            return
         
-        while unassigned:
-            print(f"剩余未分配武器数量: {len(unassigned)}")
-            
-            # 统计附加属性和技能的频率
-            add_attr_counter = Counter()
-            skill_counter = Counter()
-            
-            for weapon in unassigned:
-                add_attr_counter[weapon['add_attr']] += 1
-                skill_counter[weapon['skill']] += 1
-            
-            print(f"附加属性频率: {dict(add_attr_counter)}")
-            print(f"技能频率: {dict(skill_counter)}")
-            
-            # 找出频率最高的属性
-            all_attrs = list(add_attr_counter.items()) + list(skill_counter.items())
-            all_attrs.sort(key=lambda x: x[1], reverse=True)
-            
-            # 从最高频率开始尝试
-            best_group_cost = float('inf')
-            best_group_assignment = None
-            best_group_weapons = None
-            
-            for attr, count in all_attrs:
-                print(f"尝试属性: {attr} (出现{count}次)")
-                
-                # 根据属性类型选择武器
-                if attr in add_attr_counter:
-                    # 固定附加属性
-                    group_weapons = [w for w in unassigned if w['add_attr'] == attr]
-                    print(f"  固定附加属性 {attr}，找到 {len(group_weapons)} 个武器")
-                else:
-                    # 固定技能
-                    group_weapons = [w for w in unassigned if w['skill'] == attr]
-                    print(f"  固定技能 {attr}，找到 {len(group_weapons)} 个武器")
-                
-                # 尝试为这组武器找到合适的区域
-                region, found_fixed_type, fixed_value, cost = self.find_region_for_group(group_weapons)
-                
-                if region:
-                    print(f"  找到区域: {region}, 成本: {cost}")
-                    if cost < best_group_cost:
-                        best_group_cost = cost
-                        best_group_assignment = (region, found_fixed_type, fixed_value)
-                        best_group_weapons = group_weapons
-            
-            # 如果找到了合适的组
-            if best_group_assignment and best_group_weapons:
-                region, fixed_type, fixed_value = best_group_assignment
-                
-                print(f"\n选择了区域 {region}，固定{fixed_type}: {fixed_value}")
-                print(f"包含武器: {[w['name'] for w in best_group_weapons]}")
-                
-                # 提取主属性组合
-                main_attrs_set = set(w['main_attr'] for w in best_group_weapons)
-                main_attrs_list = list(main_attrs_set)
-                
-                # 如果主属性超过3个，需要选择最重要的3个
-                if len(main_attrs_list) > 3:
-                    # 统计主属性频率
-                    main_attr_counter = Counter(w['main_attr'] for w in best_group_weapons)
-                    # 选择频率最高的3个
-                    main_attrs_list = [attr for attr, _ in main_attr_counter.most_common(3)]
-                    print(f"主属性超过3个，选择: {main_attrs_list}")
-                
-                # 计算刷取次数
-                main_attr_counter = Counter(w['main_attr'] for w in best_group_weapons)
-                # 只考虑选择的主属性
-                selected_counter = {attr: main_attr_counter.get(attr, 0) for attr in main_attrs_list}
-                
-                # 计算需要的主属性组合
-                if len(main_attrs_list) <= 3:
-                    # 一组配置
-                    max_count = max(selected_counter.values())
-                    runs_needed = math.ceil(max_count / 2)
-                    times_needed = runs_needed * 12
-                else:
-                    # 多组配置（这里不会发生，因为我们已经限制了最多3个）
-                    times_needed = 0
-                
-                print(f"需要刷取次数: {times_needed}")
-                
-                # 创建分配记录
-                if fixed_type == 'add_attr':
-                    assignment = {
-                        '区域': region,
-                        '主属性1': main_attrs_list[0] if len(main_attrs_list) > 0 else '任意',
-                        '主属性2': main_attrs_list[1] if len(main_attrs_list) > 1 else '任意',
-                        '主属性3': main_attrs_list[2] if len(main_attrs_list) > 2 else '任意',
-                        '附加属性': fixed_value,
-                        '技能': '随机',
-                        '次数': times_needed
-                    }
-                else:  # fixed_type == 'skill'
-                    assignment = {
-                        '区域': region,
-                        '主属性1': main_attrs_list[0] if len(main_attrs_list) > 0 else '任意',
-                        '主属性2': main_attrs_list[1] if len(main_attrs_list) > 1 else '任意',
-                        '主属性3': main_attrs_list[2] if len(main_attrs_list) > 2 else '任意',
-                        '附加属性': '随机',
-                        '技能': fixed_value,
-                        '次数': times_needed
-                    }
-                
-                assignments.append(assignment)
-                total_cost += times_needed * self.region_cost[region]
-                
-                # 从未分配列表中移除这些武器
-                unassigned = [w for w in unassigned if w not in best_group_weapons]
-                print(f"移除了 {len(best_group_weapons)} 个武器\n")
-            else:
-                # 如果没有找到合适的组，尝试单个武器
-                if unassigned:
-                    print("无法找到合适的组，尝试单个武器分配")
-                    weapon = unassigned[0]
-                    # 为单个武器寻找区域
-                    region, fixed_type, fixed_value, cost = self.find_region_for_group([weapon])
-                    
-                    if region:
-                        if fixed_type == 'add_attr':
-                            assignment = {
-                                '区域': region,
-                                '主属性1': weapon['main_attr'],
-                                '主属性2': '任意',
-                                '主属性3': '任意',
-                                '附加属性': fixed_value,
-                                '技能': '随机',
-                                '次数': 12  # 单个武器需要12次
-                            }
-                        else:
-                            assignment = {
-                                '区域': region,
-                                '主属性1': weapon['main_attr'],
-                                '主属性2': '任意',
-                                '主属性3': '任意',
-                                '附加属性': '随机',
-                                '技能': fixed_value,
-                                '次数': 12
-                            }
-                        
-                        assignments.append(assignment)
-                        total_cost += 12 * self.region_cost[region]
-                        unassigned.pop(0)
-                        print(f"为单个武器 {weapon['name']} 分配了区域 {region}\n")
-                    else:
-                        print(f"警告：无法为武器 {weapon['name']} 找到合适的区域，跳过该武器\n")
-                        unassigned.pop(0)
-        
-        return assignments, total_cost
+        if messagebox.askyesno("确认", f"确定清空全部 {len(self.selected_weapons)} 个武器吗？"):
+            self.target_tree.delete(*self.target_tree.get_children())
+            self.selected_weapons.clear()
     
-    def optimize(self):
-        """执行优化"""
-        print(f"开始优化 {len(self.weapons)} 个武器...")
+    def _calculate(self):
+        """计算策略"""
+        if not self.selected_weapons:
+            messagebox.showwarning("警告", "请先选择武器")
+            return
         
-        # 按武器类别分组优化（可选）
-        assignments, total_cost = self.build_attribute_tree(self.weapons)
+        self.result_tree.delete(*self.result_tree.get_children())
         
-        return assignments, total_cost
+        try:
+            strategies = self.calculator.analyze_optimal_strategy(list(self.selected_weapons.values()))
+            
+            if not strategies:
+                messagebox.showinfo("提示", "无法生成有效策略")
+                return
+            
+            for s in strategies:
+                weapon_names = '; '.join([w.name for w in s.weapons])
+                vals = (
+                    s.zone,
+                    s.main_attrs[0] if len(s.main_attrs) > 0 else '',
+                    s.main_attrs[1] if len(s.main_attrs) > 1 else '',
+                    s.main_attrs[2] if len(s.main_attrs) > 2 else '',
+                    s.sub_attr if s.sub_attr else '随机',
+                    s.skill if s.skill else '随机',
+                    s.target_count,
+                    weapon_names
+                )
+                self.result_tree.insert('', tk.END, values=vals)
+            
+            self._export_to_csv(strategies)
+            messagebox.showinfo("完成", f"生成 {len(strategies)} 条策略，已保存至 res.csv")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"计算失败: {e}")
     
-    def save_results(self, assignments):
-        """保存结果到CSV文件"""
-        if assignments:
-            df = pd.DataFrame(assignments)
-            df = df[['区域', '主属性1', '主属性2', '主属性3', '附加属性', '技能', '次数']]
-            df.to_csv('res.csv', index=False, encoding='utf-8-sig')
-            print(f"\n结果已保存到 res.csv，共 {len(assignments)} 条策略")
-        else:
-            print("无结果可保存")
+    def _export_to_csv(self, strategies: List[Strategy]):
+        data = []
+        for s in strategies:
+            data.append({
+                '区域': s.zone,
+                '主属性1': s.main_attrs[0] if len(s.main_attrs) > 0 else '',
+                '主属性2': s.main_attrs[1] if len(s.main_attrs) > 1 else '',
+                '主属性3': s.main_attrs[2] if len(s.main_attrs) > 2 else '',
+                '附加属性': s.sub_attr if s.sub_attr else '随机',
+                '技能': s.skill if s.skill else '随机',
+                '次数': s.target_count,
+                '武器列表': ';'.join([w.name for w in s.weapons])
+            })
+        
+        pd.DataFrame(data).to_csv('res.csv', index=False, encoding='utf-8-sig')
 
-# 主程序
+
 def main():
-    # 创建规划器
-    planner = MatrixPlannerOptimized()
-    
-    print(f"需要分配的武器数量: {len(planner.weapons)}")
-    print(f"可用区域数量: {len(planner.regions)}")
-    
-    # 显示武器信息
-    print("\n武器详细信息:")
-    for weapon in planner.weapons:
-        print(f"  {weapon['name']}: 主属性={weapon['main_attr']}, 附加属性={weapon['add_attr']}, 技能={weapon['skill']}")
-    
-    # 执行优化
-    assignments, total_cost = planner.optimize()
-    
-    # 保存结果
-    planner.save_results(assignments)
-    
-    # 打印结果
-    if assignments:
-        print("\n推荐刷取策略:")
-        total_times = 0
-        weighted_cost = 0
-        
-        for i, assignment in enumerate(assignments, 1):
-            times = assignment['次数']
-            region = assignment['区域']
-            cost = times * planner.region_cost[region]
-            
-            total_times += times
-            weighted_cost += cost
-            
-            print(f"{i}. {assignment['区域']}, {assignment['主属性1']}, {assignment['主属性2']}, {assignment['主属性3']}, {assignment['附加属性']}, {assignment['技能']}, {times}")
-        
-        print(f"\n统计信息:")
-        print(f"总刷取次数: {total_times}")
-        print(f"加权总成本: {weighted_cost}")
-        print(f"策略数量: {len(assignments)}")
+    root = tk.Tk()
+    app = EssenceCalculatorGUI(root)
+    root.mainloop()
+
 
 if __name__ == "__main__":
     main()
