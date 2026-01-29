@@ -243,7 +243,7 @@ class EssenceCalculatorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("终末地武器基质刷取规划器")
-        self.root.geometry("950x800")
+        self.root.geometry("950x850")
         
         self.calculator = EssenceCalculator()
         try:
