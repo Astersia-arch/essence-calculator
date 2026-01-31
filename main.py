@@ -6,7 +6,7 @@
 import pandas as pd
 from typing import Set, Dict, List, Tuple, Optional
 from dataclasses import dataclass
-from collections import Counter
+from collections import Counter, defaultdict
 import logging
 from pathlib import Path
 from enum import Enum
@@ -139,85 +139,122 @@ class EssenceCalculator:
 
         weapons_list = list(weapons_set)
         
-        sub_freq = Counter()
-        skill_freq = Counter()
+        # 构建属性到武器的映射
+        sub_to_weapons = defaultdict(list)
+        skill_to_weapons = defaultdict(list)
         
         for w in weapons_list:
-            weight = w.rarity / 5.0
-            sub_freq[w.sub_attr] += weight
-            skill_freq[w.skill] += weight
+            sub_to_weapons[w.sub_attr].append(w)
+            skill_to_weapons[w.skill].append(w)
         
         best_score = float('-inf')
         best_strategy = None
         
-        for fixed_type, freq_dict in [(AttributeType.SUB, sub_freq), 
-                                      (AttributeType.SKILL, skill_freq)]:
+        # 尝试固定附加属性
+        for sub_attr, sub_weapons in sub_to_weapons.items():
+            # 找到包含该附加属性的所有区域
+            sub_zones = {}
+            for zone_name, zone in self.zones.items():
+                if sub_attr in zone.sub_attrs:
+                    # 检查哪些武器的技能也在该区域中
+                    compatible_weapons = []
+                    for w in sub_weapons:
+                        if w.skill in zone.skills:
+                            compatible_weapons.append(w)
+                    
+                    if compatible_weapons:
+                        sub_zones[zone_name] = {
+                            'zone': zone,
+                            'weapons': compatible_weapons
+                        }
             
-            for attr_name, freq in freq_dict.most_common():
-                if fixed_type == AttributeType.SUB:
-                    matched = [w for w in weapons_list if w.sub_attr == attr_name]
-                else:
-                    matched = [w for w in weapons_list if w.skill == attr_name]
+            if not sub_zones:
+                continue
+            
+            # 选择最佳区域
+            for zone_name, zone_data in sub_zones.items():
+                weapons_in_zone = zone_data['weapons']
+                zone_obj = zone_data['zone']
                 
-                if not matched:
+                if len(weapons_in_zone) == 0:
                     continue
                 
-                zone_name, zone = self._find_best_zone(matched, fixed_type, attr_name)
-                if not zone:
-                    continue
+                # 计算主属性
+                main_attrs = self._select_optimal_main_attrs(weapons_in_zone)
                 
-                main_attrs = self._select_optimal_main_attrs(matched)
-                
-                coverage = len(matched)
-                cost_factor = 1 / zone.cost_multiplier
-                variety = len(set(w.name for w in matched)) / coverage
-                score = coverage * cost_factor * variety * (1 + freq * 0.1)
+                # 计算分数
+                coverage = len(weapons_in_zone)
+                cost_factor = 1 / zone_obj.cost_multiplier
+                variety = len(set(w.name for w in weapons_in_zone)) / coverage
+                attr_freq = len(sub_weapons) / len(weapons_list)
+                score = coverage * cost_factor * variety * (1 + attr_freq * 0.1)
                 
                 if score > best_score:
                     best_score = score
-                    runs = self._calculate_runs(len(matched), len(main_attrs))
+                    runs = self._calculate_runs(coverage, len(main_attrs))
                     
                     best_strategy = Strategy(
                         zone=zone_name,
                         main_attrs=main_attrs,
-                        sub_attr=attr_name if fixed_type == AttributeType.SUB else None,
-                        skill=attr_name if fixed_type == AttributeType.SKILL else None,
-                        weapons=matched,
+                        sub_attr=sub_attr,
+                        skill=None,
+                        weapons=weapons_in_zone,
+                        target_count=int(runs)
+                    )
+        
+        # 尝试固定技能
+        for skill, skill_weapons in skill_to_weapons.items():
+            # 找到包含该技能的所有区域
+            skill_zones = {}
+            for zone_name, zone in self.zones.items():
+                if skill in zone.skills:
+                    # 检查哪些武器的附加属性也在该区域中
+                    compatible_weapons = []
+                    for w in skill_weapons:
+                        if w.sub_attr in zone.sub_attrs:
+                            compatible_weapons.append(w)
+                    
+                    if compatible_weapons:
+                        skill_zones[zone_name] = {
+                            'zone': zone,
+                            'weapons': compatible_weapons
+                        }
+            
+            if not skill_zones:
+                continue
+            
+            # 选择最佳区域
+            for zone_name, zone_data in skill_zones.items():
+                weapons_in_zone = zone_data['weapons']
+                zone_obj = zone_data['zone']
+                
+                if len(weapons_in_zone) == 0:
+                    continue
+                
+                # 计算主属性
+                main_attrs = self._select_optimal_main_attrs(weapons_in_zone)
+                
+                # 计算分数
+                coverage = len(weapons_in_zone)
+                cost_factor = 1 / zone_obj.cost_multiplier
+                variety = len(set(w.name for w in weapons_in_zone)) / coverage
+                attr_freq = len(skill_weapons) / len(weapons_list)
+                score = coverage * cost_factor * variety * (1 + attr_freq * 0.1)
+                
+                if score > best_score:
+                    best_score = score
+                    runs = self._calculate_runs(coverage, len(main_attrs))
+                    
+                    best_strategy = Strategy(
+                        zone=zone_name,
+                        main_attrs=main_attrs,
+                        sub_attr=None,
+                        skill=skill,
+                        weapons=weapons_in_zone,
                         target_count=int(runs)
                     )
         
         return best_strategy
-
-    def _find_best_zone(self, weapons: List[Weapon], 
-                       fixed_type: AttributeType, 
-                       fixed_attr: str) -> Tuple[str, Optional[Zone]]:
-        candidates = []
-        
-        for zone_name, zone in self.zones.items():
-            if fixed_type == AttributeType.SUB:
-                if fixed_attr not in zone.sub_attrs:
-                    continue
-            else:
-                if fixed_attr not in zone.skills:
-                    continue
-            
-            compatible = 0
-            for w in weapons:
-                if fixed_type == AttributeType.SUB:
-                    if w.skill in zone.skills:
-                        compatible += 1
-                else:
-                    if w.sub_attr in zone.sub_attrs:
-                        compatible += 1
-            
-            score = compatible / zone.cost_multiplier
-            candidates.append((zone_name, zone, score))
-        
-        if not candidates:
-            return "未知区域", None
-            
-        candidates.sort(key=lambda x: x[2], reverse=True)
-        return candidates[0][0], candidates[0][1]
 
     def _select_optimal_main_attrs(self, weapons: List[Weapon]) -> Tuple[str, ...]:
         all_attrs = []
@@ -243,7 +280,7 @@ class EssenceCalculatorGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("终末地武器基质刷取规划器")
-        self.root.geometry("950x850")
+        self.root.geometry("950x900")
         
         self.calculator = EssenceCalculator()
         try:
